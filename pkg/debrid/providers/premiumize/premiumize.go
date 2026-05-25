@@ -469,6 +469,14 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 	// Convert transfers to torrents
 	torrents := make([]*types.Torrent, 0, len(listResp.Transfers))
 	for _, transfer := range listResp.Transfers {
+		// Reconstruct magnet link from Src field if available
+		var magnetLink *utils.Magnet
+		if transfer.Src != "" {
+			magnetLink = &utils.Magnet{
+				Link: transfer.Src,
+			}
+		}
+
 		torrent := &types.Torrent{
 			Id:       transfer.ID,
 			Name:     transfer.Name,
@@ -476,6 +484,7 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 			Status:   p.mapTransferStatus(transfer.Status),
 			Progress: transfer.Progress,
 			Files:    make(map[string]types.File),
+			Magnet:   magnetLink,
 		}
 		torrents = append(torrents, torrent)
 	}
@@ -554,10 +563,13 @@ func (p *Premiumize) GetProfile() (*types.Profile, error) {
 	}
 
 	profile := &types.Profile{
-		Id:         1,
-		Username:   fmt.Sprintf("%d", accountInfo.customerIDInt64()),
-		Email:      "", // Premiumize doesn't return email in /api/account/info
-		Expiration: time.Unix(*accountInfo.PremiumUntil, 0),
+		Id:       1,
+		Username: fmt.Sprintf("%d", accountInfo.customerIDInt64()),
+		Email:    "", // Premiumize doesn't return email in /api/account/info
+	}
+
+	if accountInfo.PremiumUntil != nil {
+		profile.Expiration = time.Unix(*accountInfo.PremiumUntil, 0)
 	}
 
 	p.profile = profile
@@ -568,12 +580,6 @@ func (p *Premiumize) GetProfile() (*types.Profile, error) {
 
 // GetAvailableSlots calculates available slots from account limit
 func (p *Premiumize) GetAvailableSlots() (int, error) {
-	profile, err := p.GetProfile()
-	if err != nil {
-		return 0, err
-	}
-
-	// Get current account info for limit_used
 	resp, err := p.client.Get(fmt.Sprintf("%s/account/info", apiBase))
 	if err != nil {
 		return 0, err
@@ -600,7 +606,6 @@ func (p *Premiumize) GetAvailableSlots() (int, error) {
 		slots = 0
 	}
 
-	_ = profile // Use profile to avoid unused warning
 	return slots, nil
 }
 

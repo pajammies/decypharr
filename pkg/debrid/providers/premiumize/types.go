@@ -171,7 +171,7 @@ type CachedLink struct {
 
 // directDLContentItem represents a file in directdl response
 type directDLContentItem struct {
-	Path string
-	Size int64
-	Link string
+	Path string `json:"path"`
+	Size int64  `json:"size"`
+	Link string `json:"link"`
 }
