@@ -222,7 +222,15 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 
 	// Use directdl with the magnet link
 	data := url.Values{}
-	data.Set("src", transfer.Magnet.Link)
+	var src string
+	if transfer.Magnet != nil && transfer.Magnet.Link != "" {
+		src = transfer.Magnet.Link
+	} else if transfer.InfoHash != "" {
+		src = utils.ConstructMagnet(transfer.InfoHash, transfer.Name).Link
+	} else {
+		return types.DownloadLink{}, fmt.Errorf("no magnet or infohash available for transfer %s", torrentID)
+	}
+	data.Set("src", src)
 	payload := bytes.NewBufferString(data.Encode())
 
 	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/transfer/directdl", apiBase), payload)
