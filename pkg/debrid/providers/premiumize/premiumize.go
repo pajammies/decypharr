@@ -18,6 +18,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/request"
+	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/debrid/account"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 )
@@ -113,12 +114,12 @@ func (p *Premiumize) SubmitMagnet(tr *types.Torrent) (*types.Torrent, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var errResp ErrorResponse
+		var errResp apiError
 		_ = json.Unmarshal(body, &errResp)
 		return nil, fmt.Errorf("premiumize API error: %s (%s)", errResp.Message, errResp.Code)
 	}
 
-	var createResp TransferCreateResponse
+	var createResp transferCreateResponse
 	if err := json.Unmarshal(body, &createResp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
@@ -129,7 +130,7 @@ func (p *Premiumize) SubmitMagnet(tr *types.Torrent) (*types.Torrent, error) {
 
 	// Return transfer as torrent with initial status
 	result := &types.Torrent{
-		Id:       createResp.Id,
+		Id:       createResp.ID,
 		Name:     createResp.Name,
 		Debrid:   p.config.Name,
 		Status:   types.TorrentStatusDownloading,
@@ -242,12 +243,12 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var errResp ErrorResponse
+		var errResp apiError
 		_ = json.Unmarshal(body, &errResp)
 		return types.DownloadLink{}, fmt.Errorf("premiumize API error: %s", errResp.Message)
 	}
 
-	var dlResp DirectDLResponse
+	var dlResp directDLResponse
 	if err := json.Unmarshal(body, &dlResp); err != nil {
 		return types.DownloadLink{}, fmt.Errorf("failed to parse response: %w", err)
 	}
@@ -306,12 +307,12 @@ func (p *Premiumize) DeleteTorrent(torrentId string) error {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var errResp ErrorResponse
+		var errResp apiError
 		_ = json.Unmarshal(body, &errResp)
 		return fmt.Errorf("premiumize API error: %s", errResp.Message)
 	}
 
-	var apiResp APIResponse
+	var apiResp apiError
 	if err := json.Unmarshal(body, &apiResp); err != nil {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
@@ -333,46 +334,63 @@ func (p *Premiumize) IsAvailable(infohashes []string) map[string]bool {
 	}
 
 	result := make(map[string]bool)
+	const batchSize = 100
 
-	// Build form data with multiple items
-	data := url.Values{}
-	for _, hash := range infohashes {
-		data.Add("items[]", hash)
-	}
-	payload := bytes.NewBufferString(data.Encode())
+	for i := 0; i < len(infohashes); i += batchSize {
+		end := i + batchSize
+		if end > len(infohashes) {
+			end = len(infohashes)
+		}
 
-	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/cache/check", apiBase), payload)
-	if err != nil {
-		p.logger.Warn().Err(err).Msg("Failed to create request for cache check")
-		return result
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		// Build form data with multiple items - convert hashes to magnet URIs
+		data := url.Values{}
+		hashByItem := make(map[string]string, end-i)
+		for _, hash := range infohashes[i:end] {
+			if hash == "" {
+				continue
+			}
+			item := utils.ConstructMagnet(hash, "").Link
+			data.Add("items[]", item)
+			hashByItem[item] = hash
+		}
 
-	resp, err := p.client.Do(req)
-	if err != nil {
-		p.logger.Warn().Err(err).Msg("Failed to check cache availability")
-		return result
-	}
-	defer resp.Body.Close()
+		if len(data) == 0 {
+			continue
+		}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		p.logger.Warn().Err(err).Msg("Failed to read cache check response")
-		return result
-	}
+		payload := bytes.NewBufferString(data.Encode())
+		req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/cache/check", apiBase), payload)
+		if err != nil {
+			p.logger.Warn().Err(err).Msg("Failed to create request for cache check")
+			continue
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	var cacheResp CacheCheckResponse
-	if err := json.Unmarshal(body, &cacheResp); err != nil {
-		p.logger.Warn().Err(err).Msg("Failed to parse cache check response")
-		return result
-	}
+		resp, err := p.client.Do(req)
+		if err != nil {
+			p.logger.Warn().Err(err).Msg("Failed to check cache availability")
+			continue
+		}
+		defer resp.Body.Close()
 
-	// Map results back to infohashes
-	for i, hash := range infohashes {
-		if i < len(cacheResp.Response) {
-			result[hash] = cacheResp.Response[i]
-		} else {
-			result[hash] = false
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			p.logger.Warn().Err(err).Msg("Failed to read cache check response")
+			continue
+		}
+
+		var cacheResp cacheCheckResponse
+		if err := json.Unmarshal(body, &cacheResp); err != nil {
+			p.logger.Warn().Err(err).Msg("Failed to parse cache check response")
+			continue
+		}
+
+		// Map results back to infohashes
+		items := data["items[]"]
+		for idx, available := range cacheResp.Response {
+			if idx < len(items) && available {
+				result[hashByItem[items[idx]]] = true
+			}
 		}
 	}
 
@@ -434,12 +452,12 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var errResp ErrorResponse
+		var errResp apiError
 		_ = json.Unmarshal(body, &errResp)
 		return nil, fmt.Errorf("premiumize API error: %s", errResp.Message)
 	}
 
-	var listResp TransferListResponse
+	var listResp transferListResponse
 	if err := json.Unmarshal(body, &listResp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
@@ -452,13 +470,12 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 	torrents := make([]*types.Torrent, 0, len(listResp.Transfers))
 	for _, transfer := range listResp.Transfers {
 		torrent := &types.Torrent{
-			Id:       transfer.Id,
+			Id:       transfer.ID,
 			Name:     transfer.Name,
 			Debrid:   p.config.Name,
 			Status:   p.mapTransferStatus(transfer.Status),
 			Progress: transfer.Progress,
 			Files:    make(map[string]types.File),
-			Size:     transfer.Size,
 		}
 		torrents = append(torrents, torrent)
 	}
@@ -526,21 +543,21 @@ func (p *Premiumize) GetProfile() (*types.Profile, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var errResp ErrorResponse
+		var errResp apiError
 		_ = json.Unmarshal(body, &errResp)
 		return nil, fmt.Errorf("premiumize API error: %s", errResp.Message)
 	}
 
-	var accountInfo AccountInfo
+	var accountInfo accountInfoResponse
 	if err := json.Unmarshal(body, &accountInfo); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
 	profile := &types.Profile{
 		Id:         1,
-		Username:   accountInfo.CustomerId,
+		Username:   fmt.Sprintf("%d", accountInfo.customerIDInt64()),
 		Email:      "", // Premiumize doesn't return email in /api/account/info
-		Expiration: time.Unix(accountInfo.PremiumUntil, 0),
+		Expiration: time.Unix(*accountInfo.PremiumUntil, 0),
 	}
 
 	p.profile = profile
@@ -572,7 +589,7 @@ func (p *Premiumize) GetAvailableSlots() (int, error) {
 		return 0, fmt.Errorf("failed to get account info")
 	}
 
-	var accountInfo AccountInfo
+	var accountInfo accountInfoResponse
 	if err := json.Unmarshal(body, &accountInfo); err != nil {
 		return 0, err
 	}
