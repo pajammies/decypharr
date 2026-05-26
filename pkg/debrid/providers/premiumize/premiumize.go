@@ -500,7 +500,7 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 
 		if torrent.Status == types.TorrentStatusDownloaded {
 			if _, cached := p.directDLCache.Load(torrent.Id); !cached {
-				if err := p.populateFilesFromDirectDL(torrent, transfer); err != nil {
+				if err := p.populateFilesFromTransfer(torrent, transfer); err != nil {
 					p.logger.Warn().Err(err).Str("id", transfer.ID).Str("name", transfer.Name).Msg("Failed to get files for transfer")
 				}
 			} else {
@@ -722,49 +722,71 @@ func (p *Premiumize) refreshTransferLinks(torrent *types.Torrent) error {
 	return nil
 }
 
-func (p *Premiumize) populateFilesFromDirectDL(torrent *types.Torrent, transfer premiumizeTransfer) error {
-	var src string
-	if torrent.Magnet != nil && torrent.Magnet.Link != "" {
-		src = torrent.Magnet.Link
-	} else if torrent.InfoHash != "" {
-		src = utils.ConstructMagnet(torrent.InfoHash, torrent.Name).Link
-	} else {
-		return fmt.Errorf("no src available")
+func (p *Premiumize) populateFilesFromTransfer(torrent *types.Torrent, transfer premiumizeTransfer) error {
+	fileID := transfer.FileID.String()
+	folderID := transfer.FolderID.String()
+
+	if fileID != "" {
+		// Single file transfer — use item/details
+		return p.addFileFromItem(torrent, fileID)
+	} else if folderID != "" {
+		// Multi-file transfer — use folder/list
+		return p.addFilesFromFolder(torrent, folderID, "")
 	}
+	return fmt.Errorf("no file_id or folder_id available for transfer %s", transfer.ID)
+}
 
-	data := url.Values{}
-	data.Set("src", src)
-	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/transfer/directdl", apiBase), bytes.NewBufferString(data.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := p.client.Do(req)
+func (p *Premiumize) addFileFromItem(torrent *types.Torrent, itemID string) error {
+	resp, err := p.client.Get(fmt.Sprintf("%s/item/details?id=%s", apiBase, url.QueryEscape(itemID)))
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 
-	var dlResp directDLResponse
-	if err := json.Unmarshal(body, &dlResp); err != nil || dlResp.Status != "success" {
-		return fmt.Errorf("directdl failed")
+	var details itemDetailsResponse
+	if err := json.Unmarshal(body, &details); err != nil || details.Status != "success" {
+		return fmt.Errorf("item/details failed")
 	}
 
-	// Cache for GetDownloadLink reuse
-	expiresAt := time.Now().Add(directDLCacheTTL)
-	p.directDLCache.Store(torrent.Id, &CachedLink{
-		TransferId: torrent.Id,
-		Content:    dlResp.Content,
-		ExpiresAt:  expiresAt,
-	})
+	torrent.Files[details.Name] = types.File{
+		TorrentId: torrent.Id,
+		Name:      details.Name,
+		Path:      details.Name,
+		Size:      details.Size,
+		Link:      details.Link,
+	}
+	return nil
+}
 
-	for _, content := range dlResp.Content {
-		name := content.Path
-		torrent.Files[name] = types.File{
-			TorrentId: torrent.Id,
-			Name:      name,
-			Path:      content.Path,
-			Size:      content.Size,
-			Link:      content.Link,
+func (p *Premiumize) addFilesFromFolder(torrent *types.Torrent, folderID string, prefix string) error {
+	resp, err := p.client.Get(fmt.Sprintf("%s/folder/list?id=%s", apiBase, url.QueryEscape(folderID)))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var folder folderListResponse
+	if err := json.Unmarshal(body, &folder); err != nil || folder.Status != "success" {
+		return fmt.Errorf("folder/list failed")
+	}
+
+	for _, item := range folder.Content {
+		itemPath := item.Name
+		if prefix != "" {
+			itemPath = prefix + "/" + item.Name
+		}
+		if item.Type == "folder" {
+			_ = p.addFilesFromFolder(torrent, item.ID, itemPath)
+		} else {
+			torrent.Files[itemPath] = types.File{
+				TorrentId: torrent.Id,
+				Name:      item.Name,
+				Path:      itemPath,
+				Size:      item.Size,
+				Link:      item.Link,
+			}
 		}
 	}
 	return nil
