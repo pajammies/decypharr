@@ -479,21 +479,35 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 	for _, transfer := range listResp.Transfers {
 		// Reconstruct magnet link from Src field if available
 		var magnetLink *utils.Magnet
+		var infoHash string
 		if transfer.Src != "" {
-			magnetLink = &utils.Magnet{
-				Link: transfer.Src,
+			if m, err := utils.GetMagnetInfo(transfer.Src, false); err == nil {
+				magnetLink = m
+				infoHash = m.InfoHash
 			}
 		}
 
 		torrent := &types.Torrent{
 			Id:       transfer.ID,
 			Name:     transfer.Name,
+			InfoHash: infoHash,
 			Debrid:   p.config.Name,
 			Status:   p.mapTransferStatus(transfer.Status),
 			Progress: transfer.Progress,
 			Files:    make(map[string]types.File),
 			Magnet:   magnetLink,
 		}
+
+		if torrent.Status == types.TorrentStatusDownloaded {
+			if _, cached := p.directDLCache.Load(torrent.Id); !cached {
+				if err := p.populateFilesFromDirectDL(torrent, transfer); err != nil {
+					p.logger.Warn().Err(err).Str("id", transfer.ID).Str("name", transfer.Name).Msg("Failed to get files for transfer")
+				}
+			} else {
+				_ = p.refreshTransferLinks(torrent)
+			}
+		}
+
 		torrents = append(torrents, torrent)
 	}
 
@@ -705,5 +719,53 @@ func (p *Premiumize) refreshTransferLinks(torrent *types.Torrent) error {
 		p.directDLCache.Delete(torrent.Id)
 	}
 
+	return nil
+}
+
+func (p *Premiumize) populateFilesFromDirectDL(torrent *types.Torrent, transfer premiumizeTransfer) error {
+	var src string
+	if torrent.Magnet != nil && torrent.Magnet.Link != "" {
+		src = torrent.Magnet.Link
+	} else if torrent.InfoHash != "" {
+		src = utils.ConstructMagnet(torrent.InfoHash, torrent.Name).Link
+	} else {
+		return fmt.Errorf("no src available")
+	}
+
+	data := url.Values{}
+	data.Set("src", src)
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/transfer/directdl", apiBase), bytes.NewBufferString(data.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var dlResp directDLResponse
+	if err := json.Unmarshal(body, &dlResp); err != nil || dlResp.Status != "success" {
+		return fmt.Errorf("directdl failed")
+	}
+
+	// Cache for GetDownloadLink reuse
+	expiresAt := time.Now().Add(directDLCacheTTL)
+	p.directDLCache.Store(torrent.Id, &CachedLink{
+		TransferId: torrent.Id,
+		Content:    dlResp.Content,
+		ExpiresAt:  expiresAt,
+	})
+
+	for _, content := range dlResp.Content {
+		name := content.Path
+		torrent.Files[name] = types.File{
+			TorrentId: torrent.Id,
+			Name:      name,
+			Path:      content.Path,
+			Size:      content.Size,
+			Link:      content.Link,
+		}
+	}
 	return nil
 }
