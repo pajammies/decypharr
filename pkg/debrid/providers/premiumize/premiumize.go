@@ -45,6 +45,7 @@ type Premiumize struct {
 	transferListCacheMu sync.RWMutex
 	cachedTransfers     []*types.Torrent
 	cachedTransfersTime time.Time
+	transferMeta        *xsync.Map[string, premiumizeTransfer]
 }
 
 // New creates a new Premiumize client
@@ -76,6 +77,7 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Premiumize
 		profileCacheDuration: 1 * time.Hour,
 		directDLCache:        xsync.NewMap[string, *CachedLink](),
 		transferListCache:    xsync.NewMap[string, time.Time](),
+		transferMeta:         xsync.NewMap[string, premiumizeTransfer](),
 	}
 
 	// Fetch profile in background
@@ -419,6 +421,14 @@ func (p *Premiumize) UpdateTorrent(torrent *types.Torrent) error {
 
 	// Copy updated fields back
 	*torrent = *updated
+
+	// If still no files, force-populate bypassing cache
+	if len(torrent.Files) == 0 {
+		if rawTransfer, ok := p.transferMeta.Load(torrent.Id); ok {
+			_ = p.populateFilesFromTransfer(torrent, rawTransfer)
+		}
+	}
+
 	return nil
 }
 
@@ -497,6 +507,8 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 			Files:    make(map[string]types.File),
 			Magnet:   magnetLink,
 		}
+
+		p.transferMeta.Store(transfer.ID, transfer)
 
 		if torrent.Status == types.TorrentStatusDownloaded {
 			if _, cached := p.directDLCache.Load(torrent.Id); !cached {
@@ -751,6 +763,7 @@ func (p *Premiumize) addFileFromItem(torrent *types.Torrent, itemID string) erro
 
 	torrent.Files[details.Name] = types.File{
 		TorrentId: torrent.Id,
+		Id:        details.ID,
 		Name:      details.Name,
 		Path:      details.Name,
 		Size:      details.Size,
@@ -782,6 +795,7 @@ func (p *Premiumize) addFilesFromFolder(torrent *types.Torrent, folderID string,
 		} else {
 			torrent.Files[itemPath] = types.File{
 				TorrentId: torrent.Id,
+				Id:        item.ID,
 				Name:      item.Name,
 				Path:      itemPath,
 				Size:      item.Size,
