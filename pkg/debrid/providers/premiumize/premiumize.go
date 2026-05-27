@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -130,6 +132,13 @@ func (p *Premiumize) SubmitMagnet(tr *types.Torrent) (*types.Torrent, error) {
 		return nil, fmt.Errorf("transfer creation failed")
 	}
 
+	// Store the original magnet src so GetDownloadLink can use it later
+	p.transferMeta.Store(createResp.ID, premiumizeTransfer{
+		ID:   createResp.ID,
+		Name: createResp.Name,
+		Src:  tr.Magnet.Link,
+	})
+
 	// Return transfer as torrent with initial status
 	result := &types.Torrent{
 		Id:       createResp.ID,
@@ -179,6 +188,15 @@ func (p *Premiumize) CheckStatus(tr *types.Torrent) (*types.Torrent, error) {
 func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.DownloadLink, error) {
 	if torrentID == "" || file == nil {
 		return types.DownloadLink{}, fmt.Errorf("invalid torrent ID or file")
+	}
+
+	// If we already have a link from folder/list, just use it
+	if file.Link != "" {
+		return types.DownloadLink{
+			Link:      file.Link,
+			Token:     file.Link,
+			ExpiresAt: time.Now().Add(directDLCacheTTL),
+		}, nil
 	}
 
 	// Check cache first
@@ -275,9 +293,13 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 		ExpiresAt:  expiresAt,
 	})
 
+	normalize := func(p string) string {
+		return strings.ToLower(strings.Trim(path.Clean(p), "/"))
+	}
+
 	// Find matching file
 	for _, content := range dlResp.Content {
-		if content.Path == file.Path {
+		if normalize(content.Path) == normalize(file.Path) {
 			return types.DownloadLink{
 				Link:      content.Link,
 				Token:     content.Link,
@@ -484,6 +506,8 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 		return nil, fmt.Errorf("failed to get transfers")
 	}
 
+	p.logger.Info().Int("count", len(listResp.Transfers)).Msg("transfer/list response received")
+
 	// Convert transfers to torrents
 	torrents := make([]*types.Torrent, 0, len(listResp.Transfers))
 	for _, transfer := range listResp.Transfers {
@@ -496,6 +520,16 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 				infoHash = m.InfoHash
 			}
 		}
+
+		p.logger.Info().
+			Str("id", transfer.ID).
+			Str("name", transfer.Name).
+			Str("status", transfer.Status).
+			Str("src", transfer.Src).
+			Str("file_id", transfer.FileID.String()).
+			Str("folder_id", transfer.FolderID.String()).
+			Str("infohash", infoHash).
+			Msg("processing transfer")
 
 		torrent := &types.Torrent{
 			Id:       transfer.ID,
@@ -791,7 +825,9 @@ func (p *Premiumize) addFilesFromFolder(torrent *types.Torrent, folderID string,
 			itemPath = prefix + "/" + item.Name
 		}
 		if item.Type == "folder" {
-			_ = p.addFilesFromFolder(torrent, item.ID, itemPath)
+			if err := p.addFilesFromFolder(torrent, item.ID, itemPath); err != nil {
+				p.logger.Error().Err(err).Str("folder", itemPath).Msg("Failed to recurse into subfolder")
+			}
 		} else {
 			torrent.Files[itemPath] = types.File{
 				TorrentId: torrent.Id,
