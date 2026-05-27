@@ -181,6 +181,12 @@ func (m *Manager) detectTorrentChanges(provider string, remoteTorrentsByHash map
 
 	// Check for brand new torrents (not in cache at all)
 	for infohash, t := range remoteTorrentsByHash {
+		m.logger.Info().
+			Str("infohash", infohash).
+			Bool("in_cache", cachedInfoHashes[infohash]).
+			Int("file_count", len(t.Files)).
+			Msg("doRefreshTorrents: checking remote torrent")
+
 		if !cachedInfoHashes[infohash] {
 			newTorrents = append(newTorrents, t)
 		}
