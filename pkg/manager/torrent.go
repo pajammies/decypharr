@@ -327,6 +327,13 @@ func (m *Manager) processSyncTorrent(t *types.Torrent) (*storage.Entry, error) {
 			return nil, err
 		}
 
+		m.logger.Info().
+			Str("torrent_id", t.Id).
+			Str("torrent_name", t.Name).
+			Int("file_count", len(t.Files)).
+			Bool("is_complete", isComplete(t.Files)).
+			Msg("processSyncTorrent after UpdateTorrent")
+
 		// Re-check completion after update
 		if !isComplete(t.Files) {
 			return nil, nil
