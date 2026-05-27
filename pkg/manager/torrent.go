@@ -328,6 +328,13 @@ func (m *Manager) runBatchWriter(batchChan <-chan *storage.Entry, errChan chan<-
 
 // processSyncTorrent processes a single torrent and returns it for batched writing
 func (m *Manager) processSyncTorrent(t *types.Torrent) (*storage.Entry, error) {
+	m.logger.Info().
+		Str("torrent_id", t.Id).
+		Str("torrent_name", t.Name).
+		Int("file_count", len(t.Files)).
+		Bool("is_complete", isComplete(t.Files)).
+		Msg("processSyncTorrent entered")
+
 	// GetReader the debrid client
 	client := m.ProviderClient(t.Debrid)
 	if client == nil {
