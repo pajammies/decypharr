@@ -89,11 +89,21 @@ func (m *Manager) doRefreshTorrents(_ context.Context, provider string, debridCl
 		}
 	}
 
+	m.logger.Info().
+		Int("count", len(remoteTorrentsByHash)).
+		Msg("doRefreshTorrents: remoteTorrentsByHash built")
+
 	// Detect changes by streaming through cached entries
 	newTorrents, torrentsToUpdate, torrentsToDelete, err := m.detectTorrentChanges(provider, remoteTorrentsByHash)
 	if err != nil {
 		return err
 	}
+
+	m.logger.Info().
+		Int("new", len(newTorrents)).
+		Int("update", len(torrentsToUpdate)).
+		Int("delete", len(torrentsToDelete)).
+		Msg("doRefreshTorrents: detectTorrentChanges result")
 
 	// Handle deletions
 	m.handleTorrentDeletions(torrentsToDelete)
