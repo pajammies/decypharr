@@ -441,6 +441,8 @@ func (p *Premiumize) UpdateTorrent(torrent *types.Torrent) error {
 		return fmt.Errorf("invalid torrent")
 	}
 
+	existingFiles := torrent.Files // preserve before overwrite
+
 	// Refresh from API
 	updated, err := p.CheckStatus(torrent)
 	if err != nil {
@@ -450,7 +452,12 @@ func (p *Premiumize) UpdateTorrent(torrent *types.Torrent) error {
 	// Copy updated fields back
 	*torrent = *updated
 
-	// If still no files, force-populate bypassing cache
+	// Restore files if the update lost them
+	if len(torrent.Files) == 0 && len(existingFiles) > 0 {
+		torrent.Files = existingFiles
+	}
+
+	// If still no files, force-populate from transferMeta
 	if len(torrent.Files) == 0 {
 		if rawTransfer, ok := p.transferMeta.Load(torrent.Id); ok {
 			_ = p.populateFilesFromTransfer(torrent, rawTransfer)
