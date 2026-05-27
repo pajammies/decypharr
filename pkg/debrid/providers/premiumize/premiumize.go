@@ -199,6 +199,12 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 		}, nil
 	}
 
+	p.logger.Info().
+		Str("torrent_id", torrentID).
+		Str("file_path", file.Path).
+		Str("file_link", file.Link).
+		Msg("GetDownloadLink: file.Link empty, falling through to directdl")
+
 	// Check cache first
 	if cached, ok := p.directDLCache.Load(torrentID); ok {
 		if time.Now().Before(cached.ExpiresAt) {
@@ -520,6 +526,10 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 				infoHash = m.InfoHash
 			}
 		}
+		// Fallback: use transfer ID as infohash so the torrent is still indexable
+		if infoHash == "" {
+			infoHash = transfer.ID
+		}
 
 		p.logger.Info().
 			Str("id", transfer.ID).
@@ -772,6 +782,13 @@ func (p *Premiumize) populateFilesFromTransfer(torrent *types.Torrent, transfer 
 	fileID := transfer.FileID.String()
 	folderID := transfer.FolderID.String()
 
+	p.logger.Info().
+		Str("torrent_id", torrent.Id).
+		Str("torrent_name", torrent.Name).
+		Str("folder_id", transfer.FolderID.String()).
+		Str("file_id", transfer.FileID.String()).
+		Msg("populateFilesFromTransfer called")
+
 	if fileID != "" {
 		// Single file transfer — use item/details
 		return p.addFileFromItem(torrent, fileID)
@@ -829,6 +846,15 @@ func (p *Premiumize) addFilesFromFolder(torrent *types.Torrent, folderID string,
 				p.logger.Error().Err(err).Str("folder", itemPath).Msg("Failed to recurse into subfolder")
 			}
 		} else {
+			p.logger.Info().
+				Str("torrent", torrent.Name).
+				Str("item_id", item.ID).
+				Str("item_path", itemPath).
+				Str("item_type", item.Type).
+				Str("item_link", item.Link).
+				Int64("size", item.Size).
+				Msg("Premiumize folder item discovered")
+
 			torrent.Files[itemPath] = types.File{
 				TorrentId: torrent.Id,
 				Id:        item.ID,
