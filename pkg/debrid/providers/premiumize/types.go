@@ -61,6 +61,7 @@ type premiumizeTransfer struct {
 	FileID   nullableString   `json:"file_id"`
 	Src      string           `json:"src,omitempty"`
 	Created  flexibleUnixTime `json:"created_at,omitempty"`
+	InfoHash string           `json:"-"` // not from API — set locally
 }
 
 type cacheCheckResponse struct {

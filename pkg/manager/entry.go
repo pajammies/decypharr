@@ -208,6 +208,13 @@ func (m *Manager) getEntryChildren(group string) (*FileInfo, []FileInfo) {
 		var infos []FileInfo
 		seen := make(map[string]struct{})
 		err := m.storage.ForEachMeta(func(meta *storage.EntryMetaInfo) error {
+			m.logger.Info().
+				Str("name", meta.Name).
+				Str("infohash", meta.InfoHash).
+				Str("provider", meta.Provider).
+				Bool("bad", meta.Bad).
+				Msg("getEntryChildren __all__: iterating meta")
+
 			if _, ok := seen[meta.Name]; ok {
 				return nil
 			}

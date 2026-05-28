@@ -87,6 +87,15 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Premiumize
 		_, _ = p.GetProfile()
 	}()
 
+	// Pre-warm transferMeta by doing a GetTorrents pass at startup.
+	// This populates the xsync.Map from transfer/list + Src field for
+	// any transfers that still have Src set (newly submitted ones will).
+	go func() {
+		if _, err := p.GetTorrents(); err != nil {
+			p.logger.Warn().Err(err).Msg("Failed to pre-warm transfer metadata on startup")
+		}
+	}()
+
 	return p, nil
 }
 
@@ -134,9 +143,10 @@ func (p *Premiumize) SubmitMagnet(tr *types.Torrent) (*types.Torrent, error) {
 
 	// Store the original magnet src so GetDownloadLink can use it later
 	p.transferMeta.Store(createResp.ID, premiumizeTransfer{
-		ID:   createResp.ID,
-		Name: createResp.Name,
-		Src:  tr.Magnet.Link,
+		ID:       createResp.ID,
+		Name:     createResp.Name,
+		Src:      tr.Magnet.Link,
+		InfoHash: tr.InfoHash,
 	})
 
 	// Return transfer as torrent with initial status
@@ -145,7 +155,7 @@ func (p *Premiumize) SubmitMagnet(tr *types.Torrent) (*types.Torrent, error) {
 		Name:     createResp.Name,
 		Debrid:   p.config.Name,
 		Status:   types.TorrentStatusDownloading,
-		InfoHash: tr.Magnet.InfoHash,
+		InfoHash: tr.InfoHash,
 		Size:     tr.Magnet.Size,
 		Progress: 0,
 		Files:    make(map[string]types.File),
@@ -171,8 +181,11 @@ func (p *Premiumize) CheckStatus(tr *types.Torrent) (*types.Torrent, error) {
 			if t.Status == types.TorrentStatusDownloaded && len(t.Files) > 0 {
 				for _, file := range t.Files {
 					if file.Link == "" {
-						// Try to fetch links
-						_ = p.refreshTransferLinks(t)
+						if err := p.refreshTransferLinks(t); err != nil {
+							p.logger.Warn().Err(err).
+								Str("id", t.Id).
+								Msg("CheckStatus: failed to refresh transfer links")
+						}
 						break
 					}
 				}
@@ -460,7 +473,11 @@ func (p *Premiumize) UpdateTorrent(torrent *types.Torrent) error {
 	// If still no files, force-populate from transferMeta
 	if len(torrent.Files) == 0 {
 		if rawTransfer, ok := p.transferMeta.Load(torrent.Id); ok {
-			_ = p.populateFilesFromTransfer(torrent, rawTransfer)
+			if err := p.populateFilesFromTransfer(torrent, rawTransfer); err != nil {
+				p.logger.Warn().Err(err).
+					Str("id", torrent.Id).
+					Msg("UpdateTorrent: failed to populate files from transfer meta")
+			}
 		}
 	}
 
@@ -524,17 +541,35 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 	// Convert transfers to torrents
 	torrents := make([]*types.Torrent, 0, len(listResp.Transfers))
 	for _, transfer := range listResp.Transfers {
-		// Reconstruct magnet link from Src field if available
 		var magnetLink *utils.Magnet
 		var infoHash string
-		if transfer.Src != "" {
+
+		// FIX: Check transferMeta first — this is populated at SubmitMagnet time
+		// and is the most reliable source of infohash since transfer/list Src is unreliable.
+		if stored, ok := p.transferMeta.Load(transfer.ID); ok && stored.InfoHash != "" {
+			infoHash = stored.InfoHash
+			if stored.Src != "" && magnetLink == nil {
+				if m, err := utils.GetMagnetInfo(stored.Src, false); err == nil {
+					magnetLink = m
+				}
+			}
+		}
+
+		// Fallback: parse Src from the API response (deprecated field, often empty)
+		if infoHash == "" && transfer.Src != "" {
 			if m, err := utils.GetMagnetInfo(transfer.Src, false); err == nil {
 				magnetLink = m
 				infoHash = m.InfoHash
 			}
 		}
-		// Fallback: use transfer ID as infohash so the torrent is still indexable
+
+		// Last resort: warn loudly rather than silently using transfer ID.
+		// Symlink creation will fail for this torrent until infohash is recovered.
 		if infoHash == "" {
+			p.logger.Warn().
+				Str("id", transfer.ID).
+				Str("name", transfer.Name).
+				Msg("Could not recover infohash for transfer; symlink creation will fail until this torrent is re-submitted")
 			infoHash = transfer.ID
 		}
 
@@ -549,25 +584,44 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 			Msg("processing transfer")
 
 		torrent := &types.Torrent{
-			Id:       transfer.ID,
-			Name:     transfer.Name,
-			InfoHash: infoHash,
-			Debrid:   p.config.Name,
-			Status:   p.mapTransferStatus(transfer.Status),
-			Progress: transfer.Progress,
-			Files:    make(map[string]types.File),
-			Magnet:   magnetLink,
+			Id:               transfer.ID,
+			Name:             transfer.Name,
+			OriginalFilename: transfer.Name,
+			InfoHash:         infoHash,
+			Debrid:           p.config.Name,
+			Status:           p.mapTransferStatus(transfer.Status),
+			Progress:         transfer.Progress,
+			Files:            make(map[string]types.File),
+			Magnet:           magnetLink,
 		}
 
+		// Always update transferMeta with the latest API data, preserving
+		// any InfoHash we stored at SubmitMagnet time.
+		existing, hadExisting := p.transferMeta.Load(transfer.ID)
+		transfer.InfoHash = infoHash // carry forward whichever source won above
+		if hadExisting && existing.InfoHash != "" && transfer.InfoHash == transfer.ID {
+			// Don't overwrite a good stored InfoHash with the fallback transfer ID
+			transfer.InfoHash = existing.InfoHash
+		}
 		p.transferMeta.Store(transfer.ID, transfer)
 
+		// FIX: Populate files for finished transfers, with proper error logging.
 		if torrent.Status == types.TorrentStatusDownloaded {
 			if _, cached := p.directDLCache.Load(torrent.Id); !cached {
 				if err := p.populateFilesFromTransfer(torrent, transfer); err != nil {
-					p.logger.Warn().Err(err).Str("id", transfer.ID).Str("name", transfer.Name).Msg("Failed to get files for transfer")
+					p.logger.Warn().Err(err).
+						Str("id", transfer.ID).
+						Str("name", transfer.Name).
+						Msg("Failed to populate files for finished transfer")
 				}
 			} else {
-				_ = p.refreshTransferLinks(torrent)
+				// FIX: log errors instead of silently discarding them
+				if err := p.refreshTransferLinks(torrent); err != nil {
+					p.logger.Warn().Err(err).
+						Str("id", transfer.ID).
+						Str("name", transfer.Name).
+						Msg("Failed to refresh transfer links from cache")
+				}
 			}
 		}
 
@@ -764,24 +818,31 @@ func (p *Premiumize) refreshTransferLinks(torrent *types.Torrent) error {
 		return fmt.Errorf("invalid torrent")
 	}
 
-	// Load from cache if available
-	if cached, ok := p.directDLCache.Load(torrent.Id); ok {
-		if time.Now().Before(cached.ExpiresAt) {
-			// Update files with links from cache
-			for _, content := range cached.Content {
-				torrent.Files[content.Path] = types.File{
-					Name:      content.Path,
-					Path:      content.Path,
-					Link:      content.Link,
-					Size:      content.Size,
-					TorrentId: torrent.Id,
-				}
-			}
-			return nil
-		}
+	cached, ok := p.directDLCache.Load(torrent.Id)
+	if !ok || time.Now().After(cached.ExpiresAt) {
 		p.directDLCache.Delete(torrent.Id)
+		// Re-populate from the transfer meta if cache is stale
+		if rawTransfer, ok := p.transferMeta.Load(torrent.Id); ok {
+			return p.populateFilesFromTransfer(torrent, rawTransfer)
+		}
+		return fmt.Errorf("no cache or meta available for transfer %s", torrent.Id)
 	}
 
+	// Cache hit — repopulate files preserving existing entries
+	for _, content := range cached.Content {
+		name := path.Base(content.Path)
+		torrent.Files[content.Path] = types.File{
+			Name:      name,
+			Path:      content.Path,
+			Link:      content.Link,
+			Size:      content.Size,
+			TorrentId: torrent.Id,
+		}
+	}
+	p.logger.Debug().
+		Str("torrent_id", torrent.Id).
+		Int("file_count", len(torrent.Files)).
+		Msg("refreshTransferLinks populated files from cache")
 	return nil
 }
 
@@ -843,6 +904,8 @@ func (p *Premiumize) addFilesFromFolder(torrent *types.Torrent, folderID string,
 		return fmt.Errorf("folder/list failed")
 	}
 
+	cfg := config.Get()
+
 	for _, item := range folder.Content {
 		itemPath := item.Name
 		if prefix != "" {
@@ -861,6 +924,15 @@ func (p *Premiumize) addFilesFromFolder(torrent *types.Torrent, folderID string,
 				Str("item_link", item.Link).
 				Int64("size", item.Size).
 				Msg("Premiumize folder item discovered")
+
+			if err := cfg.IsFileAllowed(item.Name, item.Size); err != nil {
+				p.logger.Debug().
+					Str("torrent", torrent.Name).
+					Str("item_path", itemPath).
+					Err(err).
+					Msg("Premiumize skipping file")
+				continue
+			}
 
 			torrent.Files[itemPath] = types.File{
 				TorrentId: torrent.Id,

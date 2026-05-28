@@ -29,9 +29,14 @@ func (m *Manager) RefreshEntries(refreshMount bool) {
 	// Refresh entries
 	m.entry.Refresh()
 
+	m.logger.Info().
+		Bool("refreshMount", refreshMount).
+		Msg("RefreshEntries: m.entry.Refresh() completed")
+
 	// Refresh mount if needed
 	if refreshMount {
 		go func() {
+			m.logger.Info().Msg("RefreshEntries: calling RefreshMount()")
 			_ = m.RefreshMount()
 		}()
 	}
