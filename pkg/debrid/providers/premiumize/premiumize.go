@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"strings"
 	"sync"
 	"time"
 
@@ -43,7 +42,6 @@ type Premiumize struct {
 
 	// Cache for directdl results keyed by transfer source
 	directDLCache       *xsync.Map[string, *CachedLink]
-	transferListCache   *xsync.Map[string, time.Time]
 	transferListCacheMu sync.RWMutex
 	cachedTransfers     []*types.Torrent
 	cachedTransfersTime time.Time
@@ -60,8 +58,8 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Premiumize
 	}
 
 	_log := logger.New(dc.Name)
-
 	cfg := config.Get()
+
 	opts := []request.ClientOption{
 		request.WithHeaders(headers),
 		request.WithMaxRetries(cfg.Retries),
@@ -78,7 +76,6 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Premiumize
 		accountsManager:      account.NewManager(dc, ratelimits["download"], _log),
 		profileCacheDuration: 1 * time.Hour,
 		directDLCache:        xsync.NewMap[string, *CachedLink](),
-		transferListCache:    xsync.NewMap[string, time.Time](),
 		transferMeta:         xsync.NewMap[string, premiumizeTransfer](),
 	}
 
@@ -136,7 +133,6 @@ func (p *Premiumize) SubmitMagnet(tr *types.Torrent) (*types.Torrent, error) {
 	if err := json.Unmarshal(body, &createResp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
-
 	if createResp.Status != "success" {
 		return nil, fmt.Errorf("transfer creation failed")
 	}
@@ -157,7 +153,6 @@ func (p *Premiumize) SubmitMagnet(tr *types.Torrent) (*types.Torrent, error) {
 		Status:   types.TorrentStatusDownloading,
 		InfoHash: tr.InfoHash,
 		Size:     tr.Magnet.Size,
-		Progress: 0,
 		Files:    make(map[string]types.File),
 	}
 
@@ -185,8 +180,7 @@ func (p *Premiumize) CheckStatus(tr *types.Torrent) (*types.Torrent, error) {
 
 	for _, t := range transfers {
 		if t.Id == tr.Id {
-			// Update download links if finished
-			if t.Status == types.TorrentStatusDownloaded && len(t.Files) > 0 {
+			if t.Status == types.TorrentStatusDownloaded {
 				for _, file := range t.Files {
 					if file.Link == "" {
 						if err := p.refreshTransferLinks(t); err != nil {
@@ -211,7 +205,7 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 		return types.DownloadLink{}, fmt.Errorf("invalid torrent ID or file")
 	}
 
-	// If we already have a link from folder/list, just use it
+	// Fast path: link already populated from folder/list
 	if file.Link != "" {
 		return types.DownloadLink{
 			DownloadLink: file.Link,
@@ -220,18 +214,13 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 		}, nil
 	}
 
-	p.logger.Info().
-		Str("torrent_id", torrentID).
-		Str("file_path", file.Path).
-		Str("file_link", file.Link).
-		Msg("GetDownloadLink: file.Link empty, falling through to directdl")
+	p.logger.Info().Str("torrent_id", torrentID).Str("file_path", file.Path).Msg("GetDownloadLink: file.Link empty, falling through to directdl")
 
-	// Check cache first
+	// Check directdl cache
 	if cached, ok := p.directDLCache.Load(torrentID); ok {
 		if time.Now().Before(cached.ExpiresAt) {
-			// Find matching file in cached content
 			for _, content := range cached.Content {
-				if pathToFlatName(content.Path) == file.Path {
+				if path.Base(content.Path) == file.Path {
 					return types.DownloadLink{
 						DownloadLink: content.Link,
 						Token:        content.Link,
@@ -257,18 +246,13 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 			break
 		}
 	}
-
 	if transfer == nil {
 		return types.DownloadLink{}, fmt.Errorf("transfer not found: %s", torrentID)
 	}
-
-	// If transfer is not finished, we can't get direct links
 	if transfer.Status != types.TorrentStatusDownloaded {
 		return types.DownloadLink{}, fmt.Errorf("transfer not yet downloaded: status=%s", transfer.Status)
 	}
 
-	// Use directdl with the magnet link
-	data := url.Values{}
 	var src string
 	if transfer.Magnet != nil && transfer.Magnet.Link != "" {
 		src = transfer.Magnet.Link
@@ -277,6 +261,8 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 	} else {
 		return types.DownloadLink{}, fmt.Errorf("no magnet or infohash available for transfer %s", torrentID)
 	}
+
+	data := url.Values{}
 	data.Set("src", src)
 	payload := bytes.NewBufferString(data.Encode())
 
@@ -307,7 +293,6 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 	if err := json.Unmarshal(body, &dlResp); err != nil {
 		return types.DownloadLink{}, fmt.Errorf("failed to parse response: %w", err)
 	}
-
 	if dlResp.Status != "success" {
 		return types.DownloadLink{}, fmt.Errorf("directdl failed")
 	}
@@ -320,13 +305,8 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 		ExpiresAt:  expiresAt,
 	})
 
-	//normalize := func(p string) string {
-	//	return strings.ToLower(strings.Trim(path.Clean(p), "/"))
-	//}
-
-	// Find matching file
 	for _, content := range dlResp.Content {
-		if pathToFlatName(content.Path) == file.Path {
+		if path.Base(content.Path) == file.Path {
 			return types.DownloadLink{
 				DownloadLink: content.Link,
 				Token:        content.Link,
@@ -375,26 +355,23 @@ func (p *Premiumize) DeleteTorrent(torrentId string) error {
 	if err := json.Unmarshal(body, &apiResp); err != nil {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
-
 	if apiResp.Status != "success" {
 		return fmt.Errorf("failed to delete transfer")
 	}
 
 	// Clear cache for this transfer
 	p.directDLCache.Delete(torrentId)
-
 	return nil
 }
 
 // IsAvailable checks if infohashes are available in Premiumize cache
 func (p *Premiumize) IsAvailable(infohashes []string) map[string]bool {
+	result := make(map[string]bool)
 	if len(infohashes) == 0 {
-		return make(map[string]bool)
+		return result
 	}
 
-	result := make(map[string]bool)
 	const batchSize = 100
-
 	for i := 0; i < len(infohashes); i += batchSize {
 		end := i + batchSize
 		if end > len(infohashes) {
@@ -412,7 +389,6 @@ func (p *Premiumize) IsAvailable(infohashes []string) map[string]bool {
 			data.Add("items[]", item)
 			hashByItem[item] = hash
 		}
-
 		if len(data) == 0 {
 			continue
 		}
@@ -420,7 +396,7 @@ func (p *Premiumize) IsAvailable(infohashes []string) map[string]bool {
 		payload := bytes.NewBufferString(data.Encode())
 		req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/cache/check", apiBase), payload)
 		if err != nil {
-			p.logger.Warn().Err(err).Msg("Failed to create request for cache check")
+			p.logger.Warn().Err(err).Msg("Failed to create cache check request")
 			continue
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -430,9 +406,8 @@ func (p *Premiumize) IsAvailable(infohashes []string) map[string]bool {
 			p.logger.Warn().Err(err).Msg("Failed to check cache availability")
 			continue
 		}
-		defer resp.Body.Close()
-
 		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err != nil {
 			p.logger.Warn().Err(err).Msg("Failed to read cache check response")
 			continue
@@ -452,7 +427,6 @@ func (p *Premiumize) IsAvailable(infohashes []string) map[string]bool {
 			}
 		}
 	}
-
 	return result
 }
 
@@ -462,7 +436,7 @@ func (p *Premiumize) UpdateTorrent(torrent *types.Torrent) error {
 		return fmt.Errorf("invalid torrent")
 	}
 
-	existingFiles := torrent.Files // preserve before overwrite
+	existingFiles := torrent.Files
 
 	// Refresh from API
 	updated, err := p.CheckStatus(torrent)
@@ -498,13 +472,11 @@ func (p *Premiumize) GetTorrent(torrentId string) (*types.Torrent, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	for _, t := range transfers {
 		if t.Id == torrentId {
 			return t, nil
 		}
 	}
-
 	return nil, fmt.Errorf("transfer not found: %s", torrentId)
 }
 
@@ -539,7 +511,6 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 	if err := json.Unmarshal(body, &listResp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
-
 	if listResp.Status != "success" {
 		return nil, fmt.Errorf("failed to get transfers")
 	}
@@ -552,11 +523,9 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 		var magnetLink *utils.Magnet
 		var infoHash string
 
-		// FIX: Check transferMeta first — this is populated at SubmitMagnet time
-		// and is the most reliable source of infohash since transfer/list Src is unreliable.
 		if stored, ok := p.transferMeta.Load(transfer.ID); ok && stored.InfoHash != "" {
 			infoHash = stored.InfoHash
-			if stored.Src != "" && magnetLink == nil {
+			if stored.Src != "" {
 				if m, err := utils.GetMagnetInfo(stored.Src, false); err == nil {
 					magnetLink = m
 				}
@@ -571,23 +540,16 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 			}
 		}
 
-		// Last resort: warn loudly rather than silently using transfer ID.
-		// Symlink creation will fail for this torrent until infohash is recovered.
 		if infoHash == "" {
-			p.logger.Warn().
-				Str("id", transfer.ID).
-				Str("name", transfer.Name).
-				Msg("Could not recover infohash for transfer; symlink creation will fail until this torrent is re-submitted")
+			p.logger.Warn().Str("id", transfer.ID).Str("name", transfer.Name).
+				Msg("Could not recover infohash for transfer; symlink creation will fail until re-submitted")
 			infoHash = transfer.ID
 		}
 
-		p.logger.Info().
+		p.logger.Debug().
 			Str("id", transfer.ID).
 			Str("name", transfer.Name).
 			Str("status", transfer.Status).
-			Str("src", transfer.Src).
-			Str("file_id", transfer.FileID.String()).
-			Str("folder_id", transfer.FolderID.String()).
 			Str("infohash", infoHash).
 			Msg("processing transfer")
 
@@ -603,17 +565,13 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 			Magnet:           magnetLink,
 		}
 
-		// Always update transferMeta with the latest API data, preserving
-		// any InfoHash we stored at SubmitMagnet time.
 		existing, hadExisting := p.transferMeta.Load(transfer.ID)
-		transfer.InfoHash = infoHash // carry forward whichever source won above
+		transfer.InfoHash = infoHash
 		if hadExisting && existing.InfoHash != "" && transfer.InfoHash == transfer.ID {
-			// Don't overwrite a good stored InfoHash with the fallback transfer ID
 			transfer.InfoHash = existing.InfoHash
 		}
 		p.transferMeta.Store(transfer.ID, transfer)
 
-		// FIX: Populate files for finished transfers, with proper error logging.
 		if torrent.Status == types.TorrentStatusDownloaded {
 			if _, cached := p.directDLCache.Load(torrent.Id); !cached {
 				if err := p.populateFilesFromTransfer(torrent, transfer); err != nil {
@@ -623,7 +581,6 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 						Msg("Failed to populate files for finished transfer")
 				}
 			} else {
-				// FIX: log errors instead of silently discarding them
 				if err := p.refreshTransferLinks(torrent); err != nil {
 					p.logger.Warn().Err(err).
 						Str("id", transfer.ID).
@@ -645,23 +602,16 @@ func (p *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 	return torrents, nil
 }
 
-// Config returns the provider config
-func (p *Premiumize) Config() config.Debrid {
-	return p.config
-}
+func (p *Premiumize) Config() config.Debrid            { return p.config }
+func (p *Premiumize) Logger() zerolog.Logger           { return p.logger }
+func (p *Premiumize) SupportsCheck() bool              { return true }
+func (p *Premiumize) AccountManager() *account.Manager { return p.accountsManager }
 
-// Logger returns the provider logger
-func (p *Premiumize) Logger() zerolog.Logger {
-	return p.logger
-}
-
-// RefreshDownloadLinks refreshes cached download links
 func (p *Premiumize) RefreshDownloadLinks() error {
 	_, err := p.GetTorrents()
 	return err
 }
 
-// CheckFile checks if a file is available
 func (p *Premiumize) CheckFile(ctx context.Context, infohash, fileID string) error {
 	if infohash == "" {
 		return fmt.Errorf("invalid infohash")
@@ -671,147 +621,89 @@ func (p *Premiumize) CheckFile(ctx context.Context, infohash, fileID string) err
 	if !result[infohash] {
 		return fmt.Errorf("file not available in cache")
 	}
-
 	return nil
 }
 
-// AccountManager returns the account manager
-func (p *Premiumize) AccountManager() *account.Manager {
-	return p.accountsManager
-}
-
-// GetProfile gets account profile information
-func (p *Premiumize) GetProfile() (*types.Profile, error) {
-	// Check cache
-	if p.profile != nil && time.Since(p.profileLastFetched) < p.profileCacheDuration {
-		return p.profile, nil
-	}
-
+// getAccountInfo is the single source of truth for /account/info,
+// used by both GetProfile and GetAvailableSlots.
+func (p *Premiumize) getAccountInfo() (*accountInfoResponse, error) {
 	resp, err := p.client.Get(fmt.Sprintf("%s/account/info", apiBase))
 	if err != nil {
-		return nil, fmt.Errorf("failed to get profile: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, err
 	}
-
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var errResp apiError
 		_ = json.Unmarshal(body, &errResp)
 		return nil, fmt.Errorf("premiumize API error: %s", errResp.Message)
 	}
-
-	var accountInfo accountInfoResponse
-	if err := json.Unmarshal(body, &accountInfo); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+	var info accountInfoResponse
+	if err := json.Unmarshal(body, &info); err != nil {
+		return nil, err
 	}
+	return &info, nil
+}
 
+func (p *Premiumize) GetProfile() (*types.Profile, error) {
+	if p.profile != nil && time.Since(p.profileLastFetched) < p.profileCacheDuration {
+		return p.profile, nil
+	}
+	info, err := p.getAccountInfo()
+	if err != nil {
+		return nil, err
+	}
 	profile := &types.Profile{
 		Id:       1,
-		Username: fmt.Sprintf("%d", accountInfo.customerIDInt64()),
-		Email:    "", // Premiumize doesn't return email in /api/account/info
+		Username: fmt.Sprintf("%d", info.customerIDInt64()),
 	}
-
-	if accountInfo.PremiumUntil != nil {
-		profile.Expiration = time.Unix(*accountInfo.PremiumUntil, 0)
+	if info.PremiumUntil != nil {
+		profile.Expiration = time.Unix(*info.PremiumUntil, 0)
 	}
-
 	p.profile = profile
 	p.profileLastFetched = time.Now()
-
 	return profile, nil
 }
 
 // GetAvailableSlots calculates available slots from account limit
 func (p *Premiumize) GetAvailableSlots() (int, error) {
-	resp, err := p.client.Get(fmt.Sprintf("%s/account/info", apiBase))
+	info, err := p.getAccountInfo()
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 0, fmt.Errorf("failed to get account info")
-	}
-
-	var accountInfo accountInfoResponse
-	if err := json.Unmarshal(body, &accountInfo); err != nil {
-		return 0, err
-	}
-
-	// Calculate: (1.0 - limit_used) * 100 gives remaining capacity as 0-100
-	slots := int((1.0 - accountInfo.LimitUsed) * 100)
+	slots := int((1.0 - info.LimitUsed) * 100)
 	if slots < 0 {
 		slots = 0
 	}
-
 	return slots, nil
 }
 
-// SyncAccounts syncs account details
 func (p *Premiumize) SyncAccounts() {
 	_, _ = p.GetProfile()
 	_, _ = p.GetAvailableSlots()
 }
 
-// DeleteLink deletes a download link
 func (p *Premiumize) DeleteLink(dl types.DownloadLink) error {
-	if dl.Token == "" {
-		return fmt.Errorf("invalid download link token")
-	}
-
-	// Extract file ID from the link if possible
-	// For now, we'll skip deletion as Premiumize doesn't have a direct link deletion API
-	// Links expire based on transfer lifecycle
-	return nil
+	return nil // Premiumize has no link deletion API
 }
 
-// SpeedTest performs a speed test
 func (p *Premiumize) SpeedTest(ctx context.Context) types.SpeedTestResult {
-	result := types.SpeedTestResult{
-		Provider:  p.config.Name,
-		TestedAt:  time.Now(),
-		SpeedMBps: 0,
-		LatencyMs: 0,
-		BytesRead: 0,
-	}
-
-	// For now, perform a simple latency test
+	result := types.SpeedTestResult{Provider: p.config.Name, TestedAt: time.Now()}
 	start := time.Now()
 	resp, err := p.client.Get(fmt.Sprintf("%s/account/info", apiBase))
 	if err != nil {
-		result.SpeedMBps = 0
 		return result
 	}
-	defer resp.Body.Close()
-
-	latency := time.Since(start)
-	result.LatencyMs = latency.Milliseconds()
-
+	resp.Body.Close()
+	result.LatencyMs = time.Since(start).Milliseconds()
 	return result
 }
 
-// SupportsCheck returns whether this provider supports file checking
-func (p *Premiumize) SupportsCheck() bool {
-	return true // Premiumize supports cache checking
-}
-
-// Helper functions
-
 func (p *Premiumize) mapTransferStatus(status string) types.TorrentStatus {
 	switch status {
-	case "queued":
-		return types.TorrentStatusDownloading
-	case "running":
-		return types.TorrentStatusDownloading
 	case "seeding", "finished":
 		return types.TorrentStatusDownloaded
 	case "error":
@@ -829,17 +721,15 @@ func (p *Premiumize) refreshTransferLinks(torrent *types.Torrent) error {
 	cached, ok := p.directDLCache.Load(torrent.Id)
 	if !ok || time.Now().After(cached.ExpiresAt) {
 		p.directDLCache.Delete(torrent.Id)
-		// Re-populate from the transfer meta if cache is stale
 		if rawTransfer, ok := p.transferMeta.Load(torrent.Id); ok {
 			return p.populateFilesFromTransfer(torrent, rawTransfer)
 		}
 		return fmt.Errorf("no cache or meta available for transfer %s", torrent.Id)
 	}
 
-	// Cache hit — repopulate files preserving existing entries
 	for _, content := range cached.Content {
-		name := pathToFlatName(content.Path)
-		torrent.Files[content.Path] = types.File{
+		name := path.Base(content.Path)
+		torrent.Files[name] = types.File{
 			Name:      name,
 			Path:      name,
 			Link:      content.Link,
@@ -847,9 +737,7 @@ func (p *Premiumize) refreshTransferLinks(torrent *types.Torrent) error {
 			TorrentId: torrent.Id,
 		}
 	}
-	p.logger.Debug().
-		Str("torrent_id", torrent.Id).
-		Int("file_count", len(torrent.Files)).
+	p.logger.Debug().Str("torrent_id", torrent.Id).Int("file_count", len(torrent.Files)).
 		Msg("refreshTransferLinks populated files from cache")
 	return nil
 }
@@ -858,18 +746,16 @@ func (p *Premiumize) populateFilesFromTransfer(torrent *types.Torrent, transfer 
 	fileID := transfer.FileID.String()
 	folderID := transfer.FolderID.String()
 
-	p.logger.Info().
+	p.logger.Debug().
 		Str("torrent_id", torrent.Id).
-		Str("torrent_name", torrent.Name).
-		Str("folder_id", transfer.FolderID.String()).
-		Str("file_id", transfer.FileID.String()).
+		Str("folder_id", folderID).
+		Str("file_id", fileID).
 		Msg("populateFilesFromTransfer called")
 
 	if fileID != "" {
-		// Single file transfer — use item/details
 		return p.addFileFromItem(torrent, fileID)
 	} else if folderID != "" {
-		return p.addFilesFromFolder(torrent, folderID, "")
+		return p.addFilesFromFolder(torrent, folderID)
 	}
 	return fmt.Errorf("no file_id or folder_id available for transfer %s", transfer.ID)
 }
@@ -887,18 +773,19 @@ func (p *Premiumize) addFileFromItem(torrent *types.Torrent, itemID string) erro
 		return fmt.Errorf("item/details failed")
 	}
 
-	torrent.Files[details.Name] = types.File{
+	name := path.Base(details.Name)
+	torrent.Files[name] = types.File{
 		TorrentId: torrent.Id,
 		Id:        details.ID,
-		Name:      details.Name,
-		Path:      details.Name,
+		Name:      name,
+		Path:      name,
 		Size:      details.Size,
 		Link:      details.Link,
 	}
 	return nil
 }
 
-func (p *Premiumize) addFilesFromFolder(torrent *types.Torrent, folderID string, prefix string) error {
+func (p *Premiumize) addFilesFromFolder(torrent *types.Torrent, folderID string) error {
 	resp, err := p.client.Get(fmt.Sprintf("%s/folder/list?id=%s", apiBase, url.QueryEscape(folderID)))
 	if err != nil {
 		return err
@@ -911,71 +798,32 @@ func (p *Premiumize) addFilesFromFolder(torrent *types.Torrent, folderID string,
 		return fmt.Errorf("folder/list failed")
 	}
 
-	p.logger.Info().
+	p.logger.Debug().
 		Str("folder_id", folderID).
-		Str("prefix", prefix).
-		Str("folder_name", folder.Name). // what does Premiumize call this folder?
+		Str("folder_name", folder.Name).
 		Int("item_count", len(folder.Content)).
 		Msg("addFilesFromFolder: folder/list response")
 
-	for _, item := range folder.Content {
-		p.logger.Info().
-			Str("item_name", item.Name).
-			Str("item_type", item.Type).
-			Str("item_id", item.ID).
-			Msg("addFilesFromFolder: item found")
-	}
-
 	cfg := config.Get()
 	for _, item := range folder.Content {
-		var itemPath string
-		if prefix != "" {
-			itemPath = prefix + "/" + item.Name // slash, not dot
-		} else {
-			itemPath = item.Name // bare filename at root level
-		}
-
 		if item.Type == "folder" {
-			if err := p.addFilesFromFolder(torrent, item.ID, itemPath); err != nil {
-				p.logger.Error().Err(err).Str("folder", itemPath).Msg("Failed to recurse into subfolder")
+			if err := p.addFilesFromFolder(torrent, item.ID); err != nil {
+				p.logger.Error().Err(err).Str("folder", item.Name).Msg("Failed to recurse into subfolder")
 			}
 		} else {
-			if err := cfg.IsFileAllowed(item.Name, item.Size); err != nil {
+			name := path.Base(item.Name)
+			if err := cfg.IsFileAllowed(name, item.Size); err != nil {
 				continue
 			}
-			torrent.Files[itemPath] = types.File{
+			torrent.Files[name] = types.File{
 				TorrentId: torrent.Id,
 				Id:        item.ID,
-				Name:      itemPath, // e.g. "Season 1/S01E01.mkv" or just "Movie.mkv"
-				Path:      itemPath,
+				Name:      name,
+				Path:      name,
 				Size:      item.Size,
 				Link:      item.Link,
 			}
 		}
 	}
 	return nil
-}
-
-// pathToFlatName converts a slash-separated Premiumize path to a dot-joined flat filename.
-// e.g. "Show Name/Season 1/S01E01.mkv" → "Show Name.Season 1.S01E01.mkv"
-func pathToFlatName(p string) string {
-	cleaned := strings.Trim(path.Clean(p), "/")
-	return strings.ReplaceAll(cleaned, "/", ".")
-}
-
-// getFolderName fetches just the name of a folder by its ID
-func (p *Premiumize) getFolderName(folderID string) (string, error) {
-	resp, err := p.client.Get(fmt.Sprintf("%s/folder/list?id=%s", apiBase, url.QueryEscape(folderID)))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-
-	var folder folderListResponse
-	if err := json.Unmarshal(body, &folder); err != nil || folder.Status != "success" {
-		return "", fmt.Errorf("folder/list failed")
-	}
-
-	return folder.Name, nil // folderListResponse.Name is the folder's own name
 }
