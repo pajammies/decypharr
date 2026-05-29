@@ -161,6 +161,14 @@ func (p *Premiumize) SubmitMagnet(tr *types.Torrent) (*types.Torrent, error) {
 		Files:    make(map[string]types.File),
 	}
 
+	// Inject into transfer list cache so GetTorrents() finds it immediately
+	// without waiting for the next cache refresh cycle
+	p.transferListCacheMu.Lock()
+	if p.cachedTransfers != nil {
+		p.cachedTransfers = append(p.cachedTransfers, result)
+	}
+	p.transferListCacheMu.Unlock()
+
 	return result, nil
 }
 
@@ -206,9 +214,9 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 	// If we already have a link from folder/list, just use it
 	if file.Link != "" {
 		return types.DownloadLink{
-			Link:      file.Link,
-			Token:     file.Link,
-			ExpiresAt: time.Now().Add(directDLCacheTTL),
+			DownloadLink: file.Link,
+			Token:        file.Link,
+			ExpiresAt:    time.Now().Add(directDLCacheTTL),
 		}, nil
 	}
 
@@ -225,9 +233,9 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 			for _, content := range cached.Content {
 				if content.Path == file.Path {
 					return types.DownloadLink{
-						Link:      content.Link,
-						Token:     content.Link,
-						ExpiresAt: cached.ExpiresAt,
+						DownloadLink: content.Link,
+						Token:        content.Link,
+						ExpiresAt:    cached.ExpiresAt,
 					}, nil
 				}
 			}
@@ -320,9 +328,9 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 	for _, content := range dlResp.Content {
 		if normalize(content.Path) == normalize(file.Path) {
 			return types.DownloadLink{
-				Link:      content.Link,
-				Token:     content.Link,
-				ExpiresAt: expiresAt,
+				DownloadLink: content.Link,
+				Token:        content.Link,
+				ExpiresAt:    expiresAt,
 			}, nil
 		}
 	}
@@ -937,7 +945,7 @@ func (p *Premiumize) addFilesFromFolder(torrent *types.Torrent, folderID string,
 			torrent.Files[itemPath] = types.File{
 				TorrentId: torrent.Id,
 				Id:        item.ID,
-				Name:      item.Name,
+				Name:      itemPath,
 				Path:      itemPath,
 				Size:      item.Size,
 				Link:      item.Link,

@@ -350,12 +350,17 @@ func (m *Manager) processSyncTorrent(t *types.Torrent) (*storage.Entry, error) {
 			return nil, err
 		}
 
+		// ADD
 		m.logger.Info().
 			Str("torrent_id", t.Id).
-			Str("torrent_name", t.Name).
 			Int("file_count", len(t.Files)).
-			Bool("is_complete", isComplete(t.Files)).
-			Msg("processSyncTorrent after UpdateTorrent")
+			Msg("processSyncTorrent after UpdateTorrent") // already exists — add link check below
+		for name, f := range t.Files {
+			m.logger.Debug().
+				Str("file_name", name).
+				Str("link", f.Link).
+				Msg("processSyncTorrent: file after UpdateTorrent")
+		}
 
 		// Re-check completion after update
 		if !isComplete(t.Files) {
@@ -421,8 +426,29 @@ func (m *Manager) processSyncTorrent(t *types.Torrent) (*storage.Entry, error) {
 		}
 	}
 
+	// ADD: log files + links going INTO AddTorrentProvider
+	for name, f := range t.Files {
+		m.logger.Debug().
+			Str("torrent_id", t.Id).
+			Str("file_name", name).
+			Str("link", f.Link).
+			Str("file_id", f.Id).
+			Msg("processSyncTorrent: file pre-AddTorrentProvider")
+	}
+
 	// AddOrUpdate or update placement
 	placement := mt.AddTorrentProvider(t)
+
+	// ADD: log what actually got written to the ProviderEntry (what goes to DB)
+	for name, pf := range placement.Files {
+		m.logger.Debug().
+			Str("torrent_id", t.Id).
+			Str("file_name", name).
+			Str("link", pf.Link).
+			Str("file_id", pf.Id).
+			Msg("processSyncTorrent: ProviderFile post-AddTorrentProvider")
+	}
+
 	placement.Progress = t.Progress
 	if t.Status == types.TorrentStatusDownloaded {
 		downloadedAt := addedOn
