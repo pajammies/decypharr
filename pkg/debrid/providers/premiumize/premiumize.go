@@ -231,7 +231,7 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 		if time.Now().Before(cached.ExpiresAt) {
 			// Find matching file in cached content
 			for _, content := range cached.Content {
-				if content.Path == file.Path {
+				if pathToFlatName(content.Path) == file.Path {
 					return types.DownloadLink{
 						DownloadLink: content.Link,
 						Token:        content.Link,
@@ -320,13 +320,13 @@ func (p *Premiumize) GetDownloadLink(torrentID string, file *types.File) (types.
 		ExpiresAt:  expiresAt,
 	})
 
-	normalize := func(p string) string {
-		return strings.ToLower(strings.Trim(path.Clean(p), "/"))
-	}
+	//normalize := func(p string) string {
+	//	return strings.ToLower(strings.Trim(path.Clean(p), "/"))
+	//}
 
 	// Find matching file
 	for _, content := range dlResp.Content {
-		if normalize(content.Path) == normalize(file.Path) {
+		if pathToFlatName(content.Path) == file.Path {
 			return types.DownloadLink{
 				DownloadLink: content.Link,
 				Token:        content.Link,
@@ -838,10 +838,10 @@ func (p *Premiumize) refreshTransferLinks(torrent *types.Torrent) error {
 
 	// Cache hit — repopulate files preserving existing entries
 	for _, content := range cached.Content {
-		name := path.Base(content.Path)
+		name := pathToFlatName(content.Path)
 		torrent.Files[content.Path] = types.File{
 			Name:      name,
-			Path:      content.Path,
+			Path:      name,
 			Link:      content.Link,
 			Size:      content.Size,
 			TorrentId: torrent.Id,
@@ -869,7 +869,6 @@ func (p *Premiumize) populateFilesFromTransfer(torrent *types.Torrent, transfer 
 		// Single file transfer — use item/details
 		return p.addFileFromItem(torrent, fileID)
 	} else if folderID != "" {
-		// Multi-file transfer — use folder/list
 		return p.addFilesFromFolder(torrent, folderID, "")
 	}
 	return fmt.Errorf("no file_id or folder_id available for transfer %s", transfer.ID)
@@ -912,40 +911,42 @@ func (p *Premiumize) addFilesFromFolder(torrent *types.Torrent, folderID string,
 		return fmt.Errorf("folder/list failed")
 	}
 
-	cfg := config.Get()
+	p.logger.Info().
+		Str("folder_id", folderID).
+		Str("prefix", prefix).
+		Str("folder_name", folder.Name). // what does Premiumize call this folder?
+		Int("item_count", len(folder.Content)).
+		Msg("addFilesFromFolder: folder/list response")
 
 	for _, item := range folder.Content {
-		itemPath := item.Name
+		p.logger.Info().
+			Str("item_name", item.Name).
+			Str("item_type", item.Type).
+			Str("item_id", item.ID).
+			Msg("addFilesFromFolder: item found")
+	}
+
+	cfg := config.Get()
+	for _, item := range folder.Content {
+		var itemPath string
 		if prefix != "" {
-			itemPath = prefix + "/" + item.Name
+			itemPath = prefix + "/" + item.Name // slash, not dot
+		} else {
+			itemPath = item.Name // bare filename at root level
 		}
+
 		if item.Type == "folder" {
 			if err := p.addFilesFromFolder(torrent, item.ID, itemPath); err != nil {
 				p.logger.Error().Err(err).Str("folder", itemPath).Msg("Failed to recurse into subfolder")
 			}
 		} else {
-			p.logger.Info().
-				Str("torrent", torrent.Name).
-				Str("item_id", item.ID).
-				Str("item_path", itemPath).
-				Str("item_type", item.Type).
-				Str("item_link", item.Link).
-				Int64("size", item.Size).
-				Msg("Premiumize folder item discovered")
-
 			if err := cfg.IsFileAllowed(item.Name, item.Size); err != nil {
-				p.logger.Debug().
-					Str("torrent", torrent.Name).
-					Str("item_path", itemPath).
-					Err(err).
-					Msg("Premiumize skipping file")
 				continue
 			}
-
 			torrent.Files[itemPath] = types.File{
 				TorrentId: torrent.Id,
 				Id:        item.ID,
-				Name:      itemPath,
+				Name:      itemPath, // e.g. "Season 1/S01E01.mkv" or just "Movie.mkv"
 				Path:      itemPath,
 				Size:      item.Size,
 				Link:      item.Link,
@@ -953,4 +954,28 @@ func (p *Premiumize) addFilesFromFolder(torrent *types.Torrent, folderID string,
 		}
 	}
 	return nil
+}
+
+// pathToFlatName converts a slash-separated Premiumize path to a dot-joined flat filename.
+// e.g. "Show Name/Season 1/S01E01.mkv" → "Show Name.Season 1.S01E01.mkv"
+func pathToFlatName(p string) string {
+	cleaned := strings.Trim(path.Clean(p), "/")
+	return strings.ReplaceAll(cleaned, "/", ".")
+}
+
+// getFolderName fetches just the name of a folder by its ID
+func (p *Premiumize) getFolderName(folderID string) (string, error) {
+	resp, err := p.client.Get(fmt.Sprintf("%s/folder/list?id=%s", apiBase, url.QueryEscape(folderID)))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var folder folderListResponse
+	if err := json.Unmarshal(body, &folder); err != nil || folder.Status != "success" {
+		return "", fmt.Errorf("folder/list failed")
+	}
+
+	return folder.Name, nil // folderListResponse.Name is the folder's own name
 }
